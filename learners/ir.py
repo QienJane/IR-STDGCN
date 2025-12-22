@@ -123,7 +123,7 @@ class IncrementalRegularization(Base):
                     lval = lfunc(frame_feats)
                     losses[lname].update(lval.item(), output.size(0))
                     loss_tensors.append(lweight * lval)
-                else:
+                else:        # category_boundary_separation
                     if self.inversion_replay:
                         with torch.no_grad():
                             feature = self.model.forward_feature(pts_com).detach()
