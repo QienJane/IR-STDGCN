@@ -122,7 +122,7 @@ IR-STDGCN/
 ```
 
 ## Acknowledgements
-This project is based on [BOAT-MI](https://github.com/humansensinglab/dfcil-hgr) and [TD-GCN](https://github.com/liujf69/TD-GCN-Gesture). We thank the authors for their excellent work.
+This project is based on [BOAT-MI](https://github.com/humansensinglab/dfcil-hgr). We thank the authors for their excellent work.
 
 ## Contact
 For any questions, please contact zhanqq@mail2.sysu.edu.cn
