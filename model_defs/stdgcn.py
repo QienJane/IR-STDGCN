@@ -67,9 +67,11 @@ class PositionalEncoding(nn.Module) :
         Args:
         x: Tensor, shape [batch_size, seq_len * n_joints, d_model]
         """
-        x = x + self.pe[:, :x.size(1)]
-
-        return x
+        if self.dom_type == 'temporal':
+            # The first T rows encode the frame indices. Every joint in a frame shares its encoding.
+            frames = x.reshape(x.size(0), -1, self.n_joints, x.size(2))
+            return (frames + self.pe[:, :frames.size(1), None, :]).reshape_as(x)
+        return x + self.pe[:, :x.size(1)]
 
 class LayerNorm(nn.Module):
     """Construct a layernorm module (See citation for details)."""
@@ -151,7 +153,6 @@ class MultiHeadedAttention(nn.Module) :
             self.q_map = QkvProjector(d_in, self.n_heads, self.d_head)
             self.v_map = nn.Sequential(
                             QkvProjector(d_in, self.n_heads, self.d_head),
-                            nn.ReLU(),
             )
 
         else :
@@ -167,7 +168,6 @@ class MultiHeadedAttention(nn.Module) :
 
             self.v_map = nn.Sequential(
                             QkvProjector(d_in, self.n_heads, self.d_head),
-                            nn.ReLU(),
                             nn.Dropout(dropout),
             )
 
@@ -193,17 +193,17 @@ class MultiHeadedAttention(nn.Module) :
         adj: Optional[Tensor] = None,
     ) -> Tensor :
 
-        scores = q @ k.transpose(-2, -1)
-        scores = (scores * self.scaled_st_mask) + self.th_logit
+        # scaled dot-product scores, kept only on the edges allowed by the mask
+        scores = (q @ k.transpose(-2, -1)) * self.scaled_st_mask
         if isinstance(adj, np.ndarray):
             adj = torch.from_numpy(adj).float()
         if adj is not None:
             if adj.dim() == 2:
                 adj = adj.unsqueeze(0).expand(q.size(0), -1, -1)
+            # the adjacency prior modulates the scores before the mask is applied
             scores = scores * adj.unsqueeze(1)
-        tmp_max, _ = scores.max(dim=-1, keepdim=True)
-        scores = torch.exp(scores - tmp_max)
-        scores = scores / (scores.sum(dim=-1, keepdim=True) + self.eps)
+        # masked Softmax: the mask is added last, so masked edges get zero weight
+        scores = torch.softmax(scores + self.th_logit, dim=-1)
 
         out = scores @ v
         return out
@@ -488,12 +488,12 @@ class unit_gcn(nn.Module):
             self.PA = nn.Parameter(torch.from_numpy(A.astype(np.float32)))
         else:
             self.A = Variable(torch.from_numpy(A.astype(np.float32)), requires_grad=False)
-        self.alpha = nn.Parameter(torch.zeros(1)) # No I
+        self.alpha = nn.Parameter(torch.zeros(1))
         self.bn = nn.BatchNorm2d(out_channels)
         self.soft = nn.Softmax(-2)
         self.relu = nn.ReLU(inplace=True)
 
-        self.beta = nn.Parameter(torch.tensor(0.5)) # 1.0 1.4 2.0
+        self.beta = nn.Parameter(torch.tensor(0.5))
         self.gamma = nn.Parameter(torch.tensor(0.1))
 
         for m in self.modules():
@@ -544,6 +544,27 @@ class TCN_GCN_unit(nn.Module):
         fea, A_s, A_t = self.gcn1(x)
         y = self.relu(self.tcn1(fea) + self.residual(x))
         return y, A_s, A_t
+
+def build_token_priors(A_S: Tensor, A_T: Tensor):
+    """Map the TD-GC adjacency matrices to token-pair priors for STA.
+
+    Tokens are ordered frame by frame: joint u of frame t has index t * V + u.
+
+    Args :
+    A_S : Tensor, shape [bs x c x v x v], channel-dependent adjacency
+    A_T : Tensor, shape [bs x t x v x v], temporal-dependent adjacency
+    Returns :
+    prior_s : Tensor, shape [bs x n x n], entry ((t, u), (t', v)) is the channel
+              mean of A_S[u, v], shared by all frames
+    prior_t : Tensor, shape [bs x n x n], entry ((t, u), (t', v)) is A_T[t', u, v],
+              i.e. the adjacency of the frame that the key token belongs to
+    """
+    bs, n_frames, n_joints, _ = A_T.shape
+    n_pts = n_frames * n_joints
+    shape = (bs, n_frames, n_joints, n_frames, n_joints)
+    prior_s = A_S.mean(dim=1)[:, None, :, None, :].expand(shape).reshape(bs, n_pts, n_pts)
+    prior_t = A_T.permute(0, 2, 1, 3)[:, None].expand(shape).reshape(bs, n_pts, n_pts)
+    return prior_s, prior_t
 
 class Model(nn.Module):
     def __init__(self,
@@ -609,48 +630,38 @@ class Model(nn.Module):
             self.drop_out = lambda x: x
 
 
-    def forward_feature(self, x):
-        x = x.permute(0, 3, 1, 2).contiguous().unsqueeze(-1);
-        if len(x.shape) == 3:
-            B, T, VC = x.shape
-            x = x.view(B, T, self.num_point, -1).permute(0, 3, 1, 2).contiguous().unsqueeze(-1)
-        B, C, T, V, M = x.size()
-        x = x.permute(0, 4, 3, 1, 2).contiguous().view(B, M * V * C, T)
+    def _forward_sta(self, x):
+        B, T, V, C = x.shape
+        x = x.permute(0, 2, 3, 1).reshape(B, V * C, T)
         x = self.data_bn(x)
-        x = x.view(B, M, V, C, T).permute(0, 1, 3, 4, 2).contiguous().view(B * M, C, T, V)
+        x = x.view(B, V, C, T).permute(0, 2, 3, 1).contiguous()
         x, _, _ = self.l1(x)
         x, _, _ = self.l2(x)
         x, _, _ = self.l3(x)
         x, AS, AT= self.l4(x)
-        N = T * V
-        At = AT.new_zeros((B, N, N))
-        for b in range(B):
-            for t in range(T):
-                i0 = t * V
-                At[b, i0:i0 + V, i0:i0 + V] = AT[b, t]
-        AS_mean = AS.mean(dim=1)
-        As = AT.new_zeros((B, N, N))
-        for b in range(B):
-            for t in range(T):
-                i0 = t * V
-                As[b, i0:i0 + V, i0:i0 + V] = AS_mean[b]
+        As, At = build_token_priors(AS, AT)
         _, C_sta ,_ ,_ = x.shape
         x = x.permute(0, 2, 3, 1).contiguous().view(B, T * V, C_sta)
         x = self.feat_linear(x)
         x = self.spatial_att(x, As)
         x = self.temporal_att(x, At)
         x = self.inv_feat_linear(x)
-        x = x.view(B, T, V, -1).permute(0, 3, 1, 2).contiguous()
+        return x.view(B, T, V, -1)
+
+    def forward_feature(self, x, return_frame_features=False):
+        x = self._forward_sta(x)
+        if return_frame_features:
+            frame_features = x.mean(dim=2)
+        x = x.permute(0, 3, 1, 2).contiguous()
         x, _, _ = self.l5(x)
         x, _, _ = self.l6(x)
         x, _, _ = self.l7(x)
         x, _, _ = self.l8(x)
         x, _, _ = self.l9(x)
         x, _, _ = self.l10(x)
-        _, C_new, _, _ = x.shape
-        x = x.view(B, M, C_new, -1)
-        x = x.mean(3).mean(1)
-        x = self.drop_out(x)
+        x = self.drop_out(x.flatten(2).mean(dim=2))
+        if return_frame_features:
+            return x, frame_features
         return x
 
 
@@ -671,37 +682,4 @@ class Model(nn.Module):
                 T = seq_len
                 D = channel dimension (equal to channel count after inv_feat_linear)
         """
-        x = x.permute(0, 3, 1, 2).contiguous().unsqueeze(-1);
-        if len(x.shape) == 3:
-            B, T, VC = x.shape
-            x = x.view(B, T, self.num_point, -1).permute(0, 3, 1, 2).contiguous().unsqueeze(-1)
-        B, C, T, V, M = x.size()
-        x = x.permute(0, 4, 3, 1, 2).contiguous().view(B, M * V * C, T)
-        x = self.data_bn(x)
-        x = x.view(B, M, V, C, T).permute(0, 1, 3, 4, 2).contiguous().view(B * M, C, T, V)
-        x, _, _ = self.l1(x)
-        x, _, _ = self.l2(x)
-        x, _, _ = self.l3(x)
-        x, AS, AT= self.l4(x)
-        N = T * V
-        At = AT.new_zeros((B, N, N))
-        for b in range(B):
-            for t in range(T):
-                i0 = t * V
-                At[b, i0:i0 + V, i0:i0 + V] = AT[b, t]
-        AS_mean = AS.mean(dim=1)
-        As = AT.new_zeros((B, N, N))
-        for b in range(B):
-            for t in range(T):
-                i0 = t * V
-                As[b, i0:i0 + V, i0:i0 + V] = AS_mean[b]
-        _, C_sta ,_ ,_ = x.shape
-        x = x.permute(0, 2, 3, 1).contiguous().view(B, T * V, C_sta)
-        x = self.feat_linear(x)
-        x = self.spatial_att(x, As)
-        x = self.temporal_att(x, At)
-        x = self.inv_feat_linear(x)
-        x = x.view(B, T, V, -1)
-        frame_feats = x.mean(dim=2)
-
-        return frame_feats
+        return self._forward_sta(x).mean(dim=2)

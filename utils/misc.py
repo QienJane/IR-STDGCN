@@ -61,8 +61,10 @@ def load_state_dict_single(state_dict, model, optimizer=None, scheduler=None) :
         print("Optimizer and scheduler are not provided, so will NOT be loaded.")
         return
 
-    optimizer.load_state_dict(state_dict['optimizer'])
-    scheduler.load_state_dict(state_dict['scheduler'])
+    if optimizer is not None:
+        optimizer.load_state_dict(state_dict['optimizer'])
+    if scheduler is not None and state_dict.get('scheduler') is not None:
+        scheduler.load_state_dict(state_dict['scheduler'])
 
 
 def get_state_dict_single(model, optimizer, scheduler, is_distributed) :
@@ -205,7 +207,6 @@ def get_add_class_list(
 
     class_l = np.random.RandomState(seed=drop_seed).permutation(n_total_classes)
     class_l = class_l[n_known_classes : n_known_classes + n_add_classes].tolist()
-    #class_l.sort()
     return class_l
 
 

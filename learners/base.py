@@ -5,7 +5,6 @@ from torch.utils.data import DataLoader
 from easydict import EasyDict as edict
 import os, os.path as osp
 import importlib
-import sys
 from tqdm import tqdm
 import json
 import matplotlib.pyplot as plt
@@ -41,11 +40,16 @@ class Base(object):
 
     def train(self, n_trial):
         print(f"Using GPU = {self.args.gpu} with (batch_size, workers) = ({self.cfg.batch_size}, {self.cfg.workers})")
-        torch.cuda.set_device(self.args.gpu)
+        device = torch.device('cuda', self.args.gpu) if torch.cuda.is_available() else torch.device('cpu')
+        if device.type == 'cuda':
+            torch.cuda.set_device(device)
 
         self.cfg.num_total_classes = self.cfg_data.get_n_classes(self.args.split_type)
 
-        self.model = model_defs.get_model(edict({'n_classes': self.cfg.num_total_classes,**self.cfg.model}))
+        self.model = model_defs.get_model(edict({'n_classes': self.cfg.num_total_classes,**self.cfg.model})).to(device)
+        learner_type = self.cfg.increm.learner.type
+        is_ir = learner_type == 'ir'
+        log_this_process = self.args.gpu == 0 or (is_ir and not self.is_distributed)
 
         # Class mapping vars
         c = 0
@@ -56,19 +60,6 @@ class Base(object):
         for current_t_index in range(self.cfg.increm.max_task):
             train_name = str(current_t_index)
             print('======================', train_name, '=======================')
-            # Set variables depending on the task
-            if current_t_index > 0:
-                total_epochs_task = self.cfg.total_epochs_incremental_task
-                self.cfg.total_epochs = self.cfg.total_epochs_incremental_task
-                self.known_classes = self.valid_out_dim
-                self.add_classes = self.cfg.increm.other_split_size
-                self.valid_out_dim += self.cfg.increm.other_split_size
-            else:
-                total_epochs_task = self.cfg.total_epochs
-                self.valid_out_dim = self.cfg.increm.first_split_size
-                self.known_classes = 0
-                self.add_classes = self.valid_out_dim
-
             # Load best checkpoint if desired. Otherwise, continue training from last checkpoint
             if current_t_index == 1 and self.cfg.increm.load_best_checkpoint_train:
                 model_path = utils.get_best_model_path(osp.join(self.args.log_dir, f"task_{current_t_index - 1}"))
@@ -81,6 +72,34 @@ class Base(object):
                     del checkpoint
                 else:
                     raise FileNotFoundError(f"Model checkpoint not found in the log directory {self.args.log_dir}")
+
+            if current_t_index > 0:
+                # Snapshot the selected previous-task model before training or restoring the student.
+                self.model.eval()
+                if learner_type in ('ir', 'deep_inversion'):
+                    self.previous_teacher = Teacher_v2(
+                        solver=copy.deepcopy(self.model),
+                        sample_shape=(-1, self.cfg.seq_len, self.cfg.model.n_joints, self.cfg.in_channels),
+                        iters=self.power_iters, deep_inv_params=self.deep_inv_params,
+                        num_inverted_class=self.add_classes, num_known_classes=self.known_classes,
+                        config=self.cfg)
+                    self.gen_inverted_samples = True
+                    self.inversion_replay = True
+                    if not is_ir:
+                        self.previous_linear = copy.deepcopy(self.model.final)
+                else:
+                    self.previous_teacher = Teacher_v1(solver=copy.deepcopy(self.model))
+                self.KD_replay = not is_ir
+                total_epochs_task = self.cfg.total_epochs_incremental_task
+                self.cfg.total_epochs = total_epochs_task
+                self.known_classes = self.valid_out_dim
+                self.add_classes = self.cfg.increm.other_split_size
+                self.valid_out_dim += self.add_classes
+            else:
+                total_epochs_task = self.cfg.total_epochs
+                self.valid_out_dim = self.cfg.increm.first_split_size
+                self.known_classes = 0
+                self.add_classes = self.valid_out_dim
 
             model_defs.print_n_params(self.model)
             best_measure_info = utils.init_best_measure_info('acc', 'accuracy')
@@ -139,7 +158,6 @@ class Base(object):
                         checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
                         epoch = checkpoint['epoch']
                         utils.load_state_dict_single(checkpoint['state_dict'], self.model)
-                        self.model.cuda(self.args.gpu)
                     else:
                         raise FileNotFoundError(f"Model checkpoint not found in the log directory {self.args.log_dir}")
                 else:
@@ -149,7 +167,8 @@ class Base(object):
                 self.val_sampler = None
 
                 # Append coreset samples to the train/val datasets if memory>0
-                self.train_dataset.append_coreset(self.coreset_train, self.ic, only=False)
+                if not is_ir:
+                    self.train_dataset.append_coreset(self.coreset_train, self.ic, only=False)
 
                 g = torch.Generator()
                 g.manual_seed(3407)
@@ -162,28 +181,11 @@ class Base(object):
                     num_workers=self.cfg.workers, pin_memory=True, sampler=self.val_sampler, drop_last=True if self.n_gpus>1 else False,
                     worker_init_fn=utils.seed_worker, generator=g)
 
-                # Generate inverted samples
-                if self.gen_inverted_samples and (not self.is_distributed or self.args.gpu == 0):
-                    inverted_sample_dir = osp.join(self.args.log_dir, 'inverted_samples')
-                    os.makedirs(inverted_sample_dir, exist_ok=True)
-                    self.generate_inverted_samples(
-                        self.previous_teacher,
-                        self.cfg.increm.learner.n_samples_per_class,
-                        self.cfg.increm.learner.inversion_batch_size,
-                        self.cfg.batch_size,
-                        log_dir_task,
-                        inverted_sample_dir,
-                    )
-
                 # Modify the base LR if current_task_index > 0
                 if current_t_index > 0:
                     self.cfg.optimizer.lr = self.cfg.optimizer.lr_incremental_task
-                    if not self.cfg.optimizer.include_scheduler and 'scheduler' in self.cfg.optimizer :
-                        del self.cfg.optimizer.scheduler
-                        del self.cfg.optimizer['scheduler']
-                        self.cfg.step_per_epoch = False
-                        self.cfg.step_per_batch = False
-                        print("Scheduler deleted")
+                    if 'scheduler' in self.cfg.optimizer and not self.cfg.optimizer.get('include_scheduler', True):
+                        self.cfg.optimizer.pop('scheduler')
 
                 self.optimizer, self.scheduler = optimizer_defs.get_optimizer_scheduler(self.model, edict({**self.cfg.optimizer,
                                         'total_epochs': total_epochs_task, 'n_steps_per_epoch': len(self.train_loader)}) )
@@ -194,102 +196,86 @@ class Base(object):
                     print(f"=> loading checkpoint {resume_checkpoint_path}")
                     checkpoint = torch.load(resume_checkpoint_path, map_location=torch.device('cpu'))
                     start_epoch = checkpoint['epoch'] + 1
-                    if start_epoch >= total_epochs_task :
-                        print(f"Start epoch {start_epoch} is greater than total epochs {total_epochs_task}")
-                        sys.exit()
                     utils.load_state_dict_single(checkpoint['state_dict'], self.model, self.optimizer, self.scheduler, )
+                    best_measure_info.val = checkpoint.get('best_measure', best_measure_info.val)
                     print(f"=> loaded checkpoint for epoch {checkpoint['epoch']}")
                     del checkpoint
+                    if is_ir and start_epoch > total_epochs_task:
+                        self.last_valid_out_dim = self.valid_out_dim
+                        self.previous_teacher = None
+                        self.model.eval()
+                        continue
                 else :
                     start_epoch = 1
                     print("=> no checkpoint found for resuming.")
 
-                # Freeze backbone if desired (from the second task onwards)
-                if current_t_index > 0 and self.cfg.increm.freeze_feature_extractor:
+                # Keep the same synthesized inputs throughout this task, including on resume.
+                if self.gen_inverted_samples and (not self.is_distributed or self.args.gpu == 0):
+                    pool_dir = osp.join(log_dir_task if is_ir else self.args.log_dir, 'inverted_samples')
+                    pool_path = osp.join(pool_dir, 'saved_inverted_sample.pkl')
+                    if is_ir and resume_checkpoint_path and osp.isfile(pool_path):
+                        self.previous_teacher.load_inverted_samples(pool_path, self.cfg.batch_size)
+                    else:
+                        self.generate_inverted_samples(
+                            self.previous_teacher, self.cfg.increm.learner.n_samples_per_class,
+                            self.cfg.increm.learner.inversion_batch_size, self.cfg.batch_size,
+                            log_dir_task, pool_dir)
+
+                if not is_ir and current_t_index > 0 and self.cfg.increm.freeze_feature_extractor:
                     print("Freezing feature extractor...")
                     self.freeze_model(feature_extractor=True)
 
-                if current_t_index > 0 and self.cfg.increm.freeze_classifier:
+                if not is_ir and current_t_index > 0 and self.cfg.increm.freeze_classifier:
                     self.prev_weights = torch.empty_like(self.model.final.weight.data).copy_(self.model.final.weight.data)
                     self.prev_bias = torch.empty_like(self.model.final.bias.data).copy_(self.model.final.bias.data)
 
-                # transfer models
-                self.model.cuda(self.args.gpu)
+                if device.type == 'cuda':
+                    optimizer_defs.optimizer_to_cuda(self.optimizer, self.args.gpu)
 
-                # transfer optimizers and schedulers
-                optimizer_defs.optimizer_to_cuda(self.optimizer, self.args.gpu)
-                optimizer_defs.scheduler_to_cuda(self.scheduler, self.args.gpu)
-
-                if self.args.gpu == 0 :
+                if log_this_process:
                     train_logger = utils.TensorBoardLogger(osp.join(log_dir_task, 'train'))
                     val_logger = utils.TensorBoardLogger(osp.join(log_dir_task, 'val'))
 
                     # epoch, train, val bars
-                    print('Printing progress info for GPU 0 only ...')
                     ebar = tqdm(total=total_epochs_task - start_epoch + 1, leave=True, desc='epoch', dynamic_ncols=False)
                     tbar = tqdm(total=len(self.train_loader), leave=True, desc='train', dynamic_ncols=False)
                     vbar = tqdm(total=len(self.val_loader), leave=True, desc='val', dynamic_ncols=False)
 
-                step_per_epoch = False
-                if 'scheduler' in self.cfg.optimizer :
-                    if 'step_per_epoch' in self.cfg.optimizer.scheduler :
-                        step_per_epoch = self.cfg.optimizer.scheduler.step_per_epoch
+                schedule = self.cfg.optimizer.get('scheduler', {})
+                step_per_epoch = (self.scheduler is not None and not schedule.get('step_per_batch', False)
+                                  and schedule.get('step_per_epoch', True))
                 for epoch in range(start_epoch, total_epochs_task + 1) :
                     torch.cuda.empty_cache()
-                    self.train_epoch(tbar if self.args.gpu==0 else None, epoch, train_logger if self.args.gpu==0 else None, current_t_index)
-                    measures = self.validate_epoch(vbar if self.args.gpu==0 else None, epoch, val_logger if self.args.gpu==0 else None)
-                    if self.args.gpu == 0 :
-                        is_best = best_measure_info.func(measures[best_measure_info.tag],best_measure_info.val)
+                    self.train_epoch(tbar if log_this_process else None, epoch, train_logger if log_this_process else None, current_t_index)
+                    measures = self.validate_epoch(vbar if log_this_process else None, epoch, val_logger if log_this_process else None)
+                    if step_per_epoch:
+                        optimizer_defs.step_scheduler(self.scheduler)
+                    if log_this_process:
+                        is_best = epoch == 1 or best_measure_info.func(measures[best_measure_info.tag], best_measure_info.val)
                         if is_best :
                             best_measure_info.val = measures[best_measure_info.tag]
 
                         train_logger.flush()
                         val_logger.flush()
 
-                        if (epoch % self.args.save_epoch_freq == 0) and (self.args.gpu == 0) :
-                            # save model
+                        save_epoch = epoch % self.args.save_epoch_freq == 0 or epoch == total_epochs_task
+                        if save_epoch or is_best:
                             state_dict = utils.get_state_dict_single(self.model, self.optimizer, self.scheduler, self.is_distributed)
-
-                            utils.save_checkpoint(log_dir_task,
-                                {
-                                    'epoch': epoch,
-                                    'state_dict': state_dict,
-                                    'best_measure_tag': best_measure_info.tag,
-                                    'best_measure': best_measure_info.val,
-                                },
-                                epoch,
-                                save_last_only=self.args.save_last_only,
-                                is_best=is_best,
-                            )
-
-                    if step_per_epoch :
-                        optimizer_defs.step_scheduler(self.scheduler)
-
-                    if self.args.gpu == 0 :
+                            checkpoint = {'epoch': epoch, 'state_dict': state_dict,
+                                          'best_measure_tag': best_measure_info.tag, 'best_measure': best_measure_info.val}
+                            if save_epoch:
+                                utils.save_checkpoint(log_dir_task, checkpoint, epoch,
+                                                      save_last_only=self.args.save_last_only, is_best=is_best)
+                            else:
+                                torch.save(checkpoint, utils.get_best_model_path(log_dir_task))
                         ebar.update()
                         ebar.set_postfix(dict(epoch=epoch))
-            self.KD_replay = True
             self.last_valid_out_dim = self.valid_out_dim
-            # set to eval mode
             self.model.eval()
-            # new teacher
-            if self.cfg.increm.learner.type in ['deep_inversion', 'ir']:
-                self.sample_shape = (-1, self.cfg.seq_len, self.cfg.model.n_joints, self.cfg.in_channels)
-                self.previous_teacher = Teacher_v2(solver=copy.deepcopy(self.model),
-                                                    sample_shape = self.sample_shape,
-                                                    iters = self.power_iters,
-                                                    deep_inv_params = self.deep_inv_params,
-                                                    num_inverted_class = self.add_classes,
-                                                    num_known_classes = self.known_classes,
-                                                    config = self.cfg)
-                self.previous_linear = copy.deepcopy(self.model.final)
-                self.gen_inverted_samples = True
-                self.inversion_replay = True
-            else:
-                self.previous_teacher = Teacher_v1(solver=copy.deepcopy(self.model))
+            self.previous_teacher = None
 
             # Update coreset for train/val datasets if memory > 0
-            if self.cfg.increm.memory > 0:
+            if not is_ir and self.cfg.increm.memory > 0:
                 self.coreset_train = self.train_dataset.update_coreset(
                     self.coreset_train,
                     self.cfg.increm.memory,
@@ -297,7 +283,7 @@ class Base(object):
                     self.cfg.class_mapping)
 
 
-            if self.args.gpu == 0 and not (current_t_index == 0 and self.cfg.increm.load_pretrained_task0):
+            if log_this_process and not (current_t_index == 0 and self.cfg.increm.load_pretrained_task0):
                 ebar.close()
                 tbar.close()
                 vbar.close()
@@ -305,7 +291,7 @@ class Base(object):
                 val_logger.close()
 
         # save config
-        if self.args.gpu == 0:
+        if log_this_process:
             # Save config edict object
             utils.stdio.save_pickle(osp.join(self.args.log_dir, 'config.pkl'), self.cfg)
 
@@ -482,6 +468,9 @@ class Base(object):
 
 
     def evaluate(self, n_trial):
+        device = torch.device('cuda', self.args.gpu) if torch.cuda.is_available() else torch.device('cpu')
+        if device.type == 'cuda':
+            torch.cuda.set_device(device)
         is_testval = (self.args.train==0)
         if is_testval:
             mode = 'testval'
@@ -552,7 +541,7 @@ class Base(object):
                     raise FileNotFoundError(f"Model checkpoint not found in the log directory {log_dir_task}")
 
                 # transfer models
-                self.model.cuda(self.args.gpu)
+                self.model.to(device)
 
                 # evaluate
                 self.cfg = cfg
@@ -565,8 +554,9 @@ class Base(object):
 
     @torch.no_grad()
     def evaluate_task(self):
+        device = next(self.model.parameters()).device
         acc_meter = utils.Meter(self.valid_out_dim, self.cfg.label_to_name_mapped)
-        acc_meter_torchmetrics = torchmetrics.Accuracy(task='multiclass', num_classes=self.valid_out_dim).cuda(self.args.gpu)
+        acc_meter_torchmetrics = torchmetrics.Accuracy(task='multiclass', num_classes=self.valid_out_dim).to(device)
 
         # set to eval mode
         self.model.eval()
@@ -581,12 +571,9 @@ class Base(object):
 
         while bi <= n_batches :
             data = next(iter_loader)
-            utils.tensor_dict_to_cuda(data, self.args.gpu)
-
-            pts, target = data.pts, data.label
-            # Map target
-            for i, target_class in enumerate(target):
-                target[i] = self.cfg.class_mapping[str(target_class.item())]
+            pts = data['pts'].to(device)
+            labels = [self.cfg.class_mapping[str(label)] for label in data['label'].tolist()]
+            target = torch.tensor(labels, dtype=torch.long, device=device)
 
             output = self.model(pts)[:, :self.valid_out_dim]
 

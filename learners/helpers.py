@@ -1,9 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 from tqdm import tqdm
-import torchmetrics
+import tempfile
 import sys
 import os.path as osp
 import os
@@ -66,7 +65,8 @@ class Teacher_v2(nn.Module):
     def __init__(self, solver, sample_shape, iters, num_inverted_class, num_known_classes, deep_inv_params, train=True, config=None):
         super().__init__()
         self.solver = solver
-        self.solver.eval()
+        self.solver.eval().requires_grad_(False)
+        self.is_ir = config is not None and config.increm.learner.type == 'ir'
         self.sample_shape = sample_shape
         self.iters = iters
         self.config = config
@@ -75,6 +75,8 @@ class Teacher_v2(nn.Module):
         self.di_lr = deep_inv_params[0]
         self.r_feature_weight = deep_inv_params[1]
         self.di_var_scale = deep_inv_params[2]
+        if self.is_ir:
+            self.inversion_l2_weight = config.increm.learner.get('inversion_l2_weight', 1e-4)
         self.content_temp = deep_inv_params[3]
         self.content_weight = deep_inv_params[4]
         self.inv_mean = deep_inv_params[5]
@@ -88,123 +90,97 @@ class Teacher_v2(nn.Module):
         # set up criteria for optimization
         self.criterion = nn.CrossEntropyLoss()
 
-        # Create hooks for feature statistics catching
-        loss_r_feature_layers = []
-        for module in self.solver.modules():
-            if isinstance(module, nn.BatchNorm2d) or isinstance(module, nn.BatchNorm1d):
-                loss_r_feature_layers.append(DeepInversionFeatureHook(module, 0, self.r_feature_weight))
-        self.loss_r_feature_layers = loss_r_feature_layers
+    def inversion_loss(self, inputs, logits, targets, bn_hooks):
+        if self.is_ir:
+            # [B, T, V, C]: sum temporal variances over joints and coordinates.
+            variance = inputs.var(dim=1, unbiased=False).sum(dim=(1, 2)).mean()
+            input_norm = inputs.flatten(1).norm(dim=1).mean()
+            loss = (self.criterion(logits, targets) + self.di_var_scale * variance
+                    + self.inversion_l2_weight * input_norm)
+        else:
+            loss = self.criterion(logits / self.content_temp, targets) * self.content_weight
+        if bn_hooks:
+            loss = loss + self.r_feature_weight * torch.stack([hook.r_feature for hook in bn_hooks]).mean()
+        return loss
 
     def generate_inverted_samples(self, class_size, inversion_batch_size, dataloader_batch_size, log_dir_task, inverted_sample_dir):
-        # Calculate number of batches
-        size = class_size * self.num_inverted_class
-        num_batches = math.ceil(size / inversion_batch_size)
-        num_samples_batch = inversion_batch_size
-        targets_list = [i for i in range(self.num_known_classes,self.num_known_classes + self.num_inverted_class)] * class_size
-        targets_list = np.array(targets_list)
-
-        torch.cuda.empty_cache()
+        device = next(self.solver.parameters()).device
+        first_class = 0 if self.is_ir else self.num_known_classes
+        all_targets = torch.arange(first_class, self.num_k, device=device).repeat(class_size)
+        size = all_targets.numel()
         self.solver.eval()
-        self.original_pts = []
-        self.inverted_pts = []
-        self.inverted_targets = []
-        self.inverted_outputs = []
-        acc_meter = torchmetrics.Accuracy(task='multiclass', num_classes= self.config.num_total_classes).cuda()
-        tb_logger = utils.TensorBoardLogger(osp.join(log_dir_task, 'inverted_samples'))
-        print(f"Generating {size} inverted samples....................")
-        bar = tqdm(total=num_batches, leave=True, desc='Inversion steps', dynamic_ncols=False)
-        steps = 0
-        for batch_id in range(num_batches):
-            if batch_id == num_batches - 1:
-                num_samples_batch = size - (batch_id * num_samples_batch)
-            inputs = torch.normal(self.inv_mean ,self.inv_std , size=(num_samples_batch, self.sample_shape[1], self.sample_shape[2], self.sample_shape[3])).cuda()
-            inputs = nn.Parameter(inputs)
-            optimizer = optim.Adam([inputs], lr=self.di_lr, betas=[0.9, 0.999], eps = 1e-8)
-            self.original_pts.extend(inputs.data.cpu().numpy().copy())
-            targets = torch.LongTensor(targets_list[batch_id*inversion_batch_size:batch_id*inversion_batch_size + inversion_batch_size]).cuda();
-            acc_meter.reset()
-            for iteration in range(self.iters):
-                self.solver.zero_grad()
-                outputs = self.solver(inputs)
-                loss = self.criterion(outputs / self.content_temp, targets) * self.content_weight
-                for mod in self.loss_r_feature_layers:
-                    loss_distr = mod.r_feature * self.r_feature_weight / len(self.loss_r_feature_layers)
-                    loss = loss + loss_distr
-                optimizer.zero_grad()
-                loss.backward()
-                with torch.no_grad():
+        bn_hooks = [DeepInversionFeatureHook(module, self.is_ir) for module in self.solver.modules()
+                    if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d))]
+
+        pool = {'pts': [], 'target': [], 'output': []}
+        log_dir = osp.join(log_dir_task, 'inverted_samples')
+        if self.is_ir:
+            inverted_sample_dir = log_dir
+            # The logger clears its own directory on restart. Keep the replay pool alongside it.
+            log_dir = osp.join(log_dir, 'events')
+        tb_logger = utils.TensorBoardLogger(log_dir)
+        n_correct = 0
+        try:
+            batches = all_targets.split(inversion_batch_size)
+            for batch_id, targets in enumerate(tqdm(batches, desc='Inversion batches')):
+                inputs = torch.empty((len(targets), *self.sample_shape[1:]), device=device)
+                inputs.normal_(self.inv_mean, self.inv_std).requires_grad_()
+                optimizer = optim.Adam([inputs], lr=self.di_lr)
+                for iteration in range(self.iters):
+                    outputs = self.solver(inputs)
+                    logits = outputs[:, :self.num_k] if self.is_ir else outputs
+                    loss = self.inversion_loss(inputs, logits, targets, bn_hooks)
+                    correct = (logits.argmax(dim=1) == targets).sum().item()
+                    if iteration > 0 and 100 * correct / len(targets) > self.config.increm.learner.inverted_acc_thred:
+                        break
+                    optimizer.zero_grad()
+                    loss.backward()
                     optimizer.step()
-                    acc = acc_meter(outputs, targets) * 100
+                else:
+                    # Save predictions of the final optimized inputs, including the last update.
+                    with torch.no_grad():
+                        outputs = self.solver(inputs)
+                        logits = outputs[:, :self.num_k] if self.is_ir else outputs
+                        correct = (logits.argmax(dim=1) == targets).sum().item()
 
-                if acc.item() > self.config.increm.learner.inverted_acc_thred:
-                    break
-            # update tb_logger
-            tb_logger.update({
-                'inverted_training_loss': loss.item(),
-                }, step=steps, prefix="loss" )
-            tb_logger.update({
-                'inverted_training_acc': acc.item(),
-                }, step=steps, prefix="acc" )
-            steps += 1
-            # update progress bar
-            bar.update()
-            # clear cuda cache
-            torch.cuda.empty_cache()
+                n_correct += correct
+                tb_logger.update({'inverted_training_loss': loss.item()}, step=batch_id, prefix='loss')
+                tb_logger.update({'inverted_training_acc': 100 * correct / len(targets)}, step=batch_id, prefix='acc')
+                pool['pts'].extend(inputs.detach().cpu().numpy())
+                pool['target'].extend(targets.cpu().numpy())
+                pool['output'].extend(outputs.detach().cpu().numpy())
+                # An early stop skips backward on this forward pass. Release its graph before the next batch.
+                del outputs, logits, loss
+                for hook in bn_hooks:
+                    hook.r_feature = None
+        finally:
+            tb_logger.close()
+            for hook in bn_hooks:
+                hook.close()
+        print(f"Acc inverted samples = {100 * n_correct / size:.2f}")
 
-            self.inverted_pts.extend(inputs.data.cpu().numpy())
-            self.inverted_targets.extend(targets.cpu().numpy())
-
-        bar.close()
-        tb_logger.close()
-        acc_meter.reset()
-
-        print("Check accuracy with the inverted samples:")
-
-        # Inverted input accuracy
-        num_samples_batch = inversion_batch_size
-        for batch_id in range(num_batches):
-            if batch_id == num_batches - 1:
-                num_samples_batch = size - (batch_id * num_samples_batch)
-
-            inputs_list = self.inverted_pts[batch_id*inversion_batch_size:batch_id*inversion_batch_size + num_samples_batch]
-            targets_list = self.inverted_targets[batch_id*inversion_batch_size:batch_id*inversion_batch_size + num_samples_batch]
-
-            inputs = torch.zeros(size=(num_samples_batch, self.sample_shape[1], self.sample_shape[2], self.sample_shape[3])).cuda()
-            targets = torch.zeros(size=(num_samples_batch,)).cuda()
-            for i in range(len(inputs_list)):
-                inputs[i] = torch.from_numpy(inputs_list[i])
-                targets[i] = targets_list[i]
-
-            with torch.inference_mode():
-                outputs = self.solver(inputs)
-                acc = acc_meter(outputs, targets) * 100
-                self.inverted_outputs.extend(outputs.cpu().numpy())
-        print(f"Acc inverted samples = {acc_meter.compute() * 100}")
-        acc_meter.reset()
-
-        # save inverted samples
         os.makedirs(inverted_sample_dir, exist_ok=True)
-        fname = "saved_inverted_sample" + '.pkl'
-        fpath = osp.join(inverted_sample_dir, fname)
-        if self.num_known_classes !=0:
-            print("load saved data")
-            saved_data  = utils.load_pickle(fpath);
-            self.inverted_pts.extend(saved_data["pts"])
-            self.inverted_targets.extend(saved_data["target"])
-            self.inverted_outputs.extend(saved_data["output"])
-            os.remove(fpath)
+        fpath = osp.join(inverted_sample_dir, 'saved_inverted_sample.pkl')
+        if not self.is_ir and self.num_known_classes:
+            saved = utils.load_pickle(fpath)
+            for key in pool:
+                pool[key].extend(saved[key])
+        with tempfile.TemporaryDirectory(dir=inverted_sample_dir) as scratch:
+            pending = osp.join(scratch, 'pool.pkl')
+            utils.save_pickle(pending, pool)
+            os.replace(pending, fpath)
 
-        save_dict = {
-            'pts': self.inverted_pts,
-            'target': self.inverted_targets,
-            'output': self.inverted_outputs,
-        }
-        utils.save_pickle(fpath, save_dict);
+        self._set_replay_pool(pool, dataloader_batch_size)
 
-        self.inverted_dataset = InvertedDataset(self.inverted_pts, self.inverted_targets, self.inverted_outputs)
-        self.inverted_dataloader = DataLoader(self.inverted_dataset, batch_size=dataloader_batch_size, shuffle=True, num_workers=self.config.workers, pin_memory=True)
+    def load_inverted_samples(self, path, dataloader_batch_size):
+        self._set_replay_pool(utils.load_pickle(path), dataloader_batch_size)
+
+    def _set_replay_pool(self, pool, dataloader_batch_size):
+        self.inverted_dataset = InvertedDataset(pool['pts'], pool['target'], pool['output'])
+        device = next(self.solver.parameters()).device
+        self.inverted_dataloader = DataLoader(self.inverted_dataset, batch_size=dataloader_batch_size, shuffle=True,
+                                               num_workers=self.config.workers, pin_memory=device.type == 'cuda')
         self.inverted_iterator = iter(self.inverted_dataloader)
-
 
     def sample(self):
         try:
@@ -245,33 +221,23 @@ class Teacher_v2(nn.Module):
 
 class DeepInversionFeatureHook():
 
-    def __init__(self, module, gram_matrix_weight, layer_weight):
+    def __init__(self, module, is_ir):
         self.hook = module.register_forward_hook(self.hook_fn)
-        self.target = None
-        self.gram_matrix_weight = gram_matrix_weight
-        self.layer_weight = layer_weight
+        self.is_ir = is_ir
 
-    def hook_fn(self, module, input, output):
-        input_tensor = input[0]
-        input_dim = len(input_tensor.shape)
-
-        if input_dim == 4:
-            # Input shape: [N, C, T, V]
-            mean = input_tensor.mean(dim=[0, 2, 3])  # Shape: [C]
-            var = input_tensor.var(dim=[0, 2, 3], unbiased=False) + 1e-8  # Shape: [C]
-        elif input_dim == 3:
-            # Input shape: [N, C, T]
-            mean = input_tensor.mean(dim=[0, 2])  # Shape: [C]
-            var = input_tensor.var(dim=[0, 2], unbiased=False) + 1e-8  # Shape: [C]
+    def hook_fn(self, module, inputs, output):
+        if not torch.is_grad_enabled():
+            return
+        x = inputs[0]
+        axes = (0, *range(2, x.ndim))
+        var, mean = torch.var_mean(x, dim=axes, unbiased=False)
+        mean_diff = module.running_mean - mean
+        if self.is_ir:
+            self.r_feature = mean_diff.norm() + (module.running_var - var).norm()
         else:
-            raise ValueError(f"Unsupported input dimensions: {input_tensor.shape}")
-
-        running_mean = module.running_mean.data.type(mean.type())
-        running_var = module.running_var.data.type(var.type()) + 1e-8
-
-        r_feature = torch.log(var.sqrt()/running_var.sqrt()).mean()-0.5*((1.0-(running_var+(running_mean-mean)**2)/var).mean())
-
-        self.r_feature = r_feature
+            var = var + 1e-8
+            running_var = module.running_var + 1e-8
+            self.r_feature = 0.5 * (torch.log(var / running_var) + (running_var + mean_diff.square()) / var - 1).mean()
 
     def close(self):
         self.hook.remove()

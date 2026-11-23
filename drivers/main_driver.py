@@ -37,7 +37,7 @@ parser.add_argument('--log_dir', type=str, default='/.../IR-STDGCN/output/shrec'
 parser.add_argument('--save_last_only', action='store_true', help='whether to save the last epoch only.')
 parser.add_argument('--save_epoch_freq', type=int, default=1, help='epoch frequency to save checkpoints.')
 parser.add_argument('--save_conf_mat', action='store_true', default=1, help='whether to save the confusion matrix.')
-parser.add_argument('--gpu', type=int, default=1, help='GPU ID.')
+parser.add_argument('--gpu', type=int, default=0, help='GPU ID.')
 parser.add_argument('--trial_id', type=int, default=5, help='trial_ID')
 
 

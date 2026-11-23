@@ -2,7 +2,24 @@ from easydict import EasyDict as edict
 
 import torch
 
-from .schedulers import *
+def get_scheduler(optimizer, cfg):
+    steps_per_epoch = cfg['n_steps_per_epoch'] if cfg.get('step_per_batch') else 1
+    warmup_steps = cfg.get('warmup_epochs', 0) * steps_per_epoch
+    milestones = cfg.get('milestones', [])
+    gamma = cfg.get('gamma', 0.1)
+
+    def lr_factor(step):
+        if step < warmup_steps:
+            return (step + 1) / warmup_steps
+        epoch = step // steps_per_epoch + 1
+        return gamma ** sum(epoch >= milestone for milestone in milestones)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+
+
+def step_scheduler(scheduler):
+    if scheduler is not None:
+        scheduler.step()
 
 def get_optimizer_scheduler(model, cfg) :
     cfg = edict(cfg)
@@ -18,7 +35,7 @@ def get_optimizer_scheduler(model, cfg) :
         lr = cfg.lr if 'lr' in cfg else 0.001
         betas = cfg.betas if 'betas' in cfg else (0.9, 0.999)
         optimizer = torch.optim.Adam(
-                        filter(lambda p: p.requires_grad, model_params), #model_params,
+                        filter(lambda p: p.requires_grad, model_params),
                         lr=lr,
                         betas=betas,
         )
@@ -33,6 +50,7 @@ def get_optimizer_scheduler(model, cfg) :
                         lr=lr,
                         momentum=momentum,
                         weight_decay=weight_decay,
+                        nesterov=cfg.get('nesterov', False),
         )
 
     else :

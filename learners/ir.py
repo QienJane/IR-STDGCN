@@ -1,267 +1,144 @@
 import torch
-from easydict import EasyDict as edict
+import torch.nn.functional as F
 import torchmetrics
-import numpy as np
-
-import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix
-import seaborn as sns
-
+from easydict import EasyDict as edict
 
 import optimizers as optimizer_defs
 import utils
-import model_defs
 from .base import Base
-from torchsummary import summary
+
+
+def real_batch(data, class_mapping, device):
+    pts = data['pts'].to(device)
+    labels = [class_mapping[str(label)] for label in data['label'].tolist()]
+    return pts, torch.tensor(labels, dtype=torch.long, device=device)
+
 
 class IncrementalRegularization(Base):
     def __init__(self, cfg, cfg_data, args, is_train, is_distributed, n_gpus):
-        super(IncrementalRegularization, self).__init__(cfg, cfg_data, args, is_train, is_distributed, n_gpus)
+        super().__init__(cfg, cfg_data, args, is_train, is_distributed, n_gpus)
+        defaults = {
+            'domain_consistency': {'weight': 1.0},
+            'category_boundary_separation': {'weight': 0.5, 'class_weight': None, 'ignore': None},
+            'smooth_regularization': {'weight': 0.1},
+        }
+        configured = cfg.get('loss', defaults)
+        cfg.loss = edict({
+            name: {**params, **configured[name]}
+            for name, params in defaults.items() if name in configured
+        })
+        if not any(term.weight for term in cfg.loss.values()):
+            raise ValueError("IR training requires at least one active incremental loss.")
+
         self.inversion_replay = False
-        self.KD_replay = False
         self.power_iters = self.cfg.increm.learner.power_iters
         self.deep_inv_params = self.cfg.increm.learner.deep_inv_params
         self.gen_inverted_samples = False
 
-    def train_epoch(self, tbar, epoch, train_logger, current_t_index) :
-        losses = edict({
-            name: utils.AverageMeter() for name in self.criteria
-        })
-        # Class to save epoch metrics
-        acc_meter_global = torchmetrics.Accuracy(task='multiclass', num_classes=self.valid_out_dim).cuda(self.args.gpu)
-
-        n_batches = len(self.train_loader)
-
+    def train_epoch(self, tbar, epoch, train_logger, current_t_index):
+        losses = {name: utils.AverageMeter() for name in self.criteria}
+        device = next(self.model.parameters()).device
+        acc_meter_global = torchmetrics.Accuracy(task='multiclass', num_classes=self.valid_out_dim).to(device)
         self.model.train()
 
-        if self.train_sampler is not None :
+        if self.train_sampler is not None:
             self.train_sampler.set_epoch(self.train_sampler.epoch + 1)
-
-        if self.args.gpu == 0 :
-            tbar.reset(total=n_batches)
+        if tbar is not None:
+            tbar.reset(total=len(self.train_loader))
             tbar.refresh()
 
-        step_per_batch = False
-        if 'scheduler' in self.cfg.optimizer :
-            if 'step_per_batch' in self.cfg.optimizer.scheduler :
-                step_per_batch = self.cfg.optimizer.scheduler.step_per_batch
-
-        iter_loader = iter(self.train_loader)
-
-        bi = 1
-        while bi <= n_batches :
-            data = next(iter_loader)
-            utils.tensor_dict_to_cuda(data, self.args.gpu)
-
-            pts, target = data.pts, data.label
-
-            pts_replay = None
-            target_replay = None
-            target_replay_hat = None
-
-            # Map target
-            for i, target_class in enumerate(target):
-                target[i] = self.cfg.class_mapping[str(target_class.item())]
-            if self.inversion_replay:
-                pts_replay, target_replay, target_replay_hat = self.sample(self.previous_teacher)
-                pts_replay = pts_replay.cuda(self.args.gpu)
-                target_replay = target_replay.cuda(self.args.gpu)
-                target_replay_hat = target_replay_hat.cuda(self.args.gpu)
-
-            # if KD -> generate pseudo labels
-            if self.KD_replay and self.inversion_replay:
-                allowed_predictions = np.arange(self.last_valid_out_dim)
-                target_hat = self.previous_teacher.generate_scores(pts, allowed_predictions=allowed_predictions)
-                _, target_hat_com = self.combine_data(((pts, target_hat),(pts_replay, target_replay_hat[:,:self.last_valid_out_dim])))
+        step_per_batch = self.cfg.optimizer.get('scheduler', {}).get('step_per_batch', False)
+        active = {name: term for name, term in self.criteria.items() if term.weight}
+        for bi, data in enumerate(self.train_loader, start=1):
+            pts, target = real_batch(data, self.cfg.class_mapping, device)
+            if current_t_index == 0:
+                output = self.model(pts)[:, :self.valid_out_dim]
+                loss = F.cross_entropy(output, target)
+                if 'category_boundary_separation' in losses:
+                    losses['category_boundary_separation'].update(loss.item(), len(pts))
+                combined_targets = target
             else:
-                target_hat_com = None
+                old_pts, old_target = self.sample(self.previous_teacher)[:2]
+                combined_pts = torch.cat((pts, old_pts.to(device)))
+                combined_targets = torch.cat((target, old_target.to(device)))
+                features, frame_feats = self.model.forward_feature(combined_pts, return_frame_features=True)
 
-            # combine inputs and generated samples for classification
-            if self.inversion_replay:
-                pts_com, target_com = self.combine_data(((pts, target),(pts_replay, target_replay)))
-            else:
-                pts_com, target_com = pts, target
-
-            features = self.model.forward_feature(pts_com)
-
-            output = self.model.final(features)[:, :self.valid_out_dim]
-            batch_idx = np.arange(len(pts))
-            kd_index = np.arange(len(pts_com))
-            loss_tensors = []
-
-            # class balancing
-            mappings = torch.ones(target_com.size(), dtype=torch.float32)
-            mappings = mappings.cuda()
-            rnt = 1.0 * self.last_valid_out_dim / self.valid_out_dim
-            mappings[:len(pts)] = 1-rnt
-            mappings[len(pts):] = rnt
-            dw_cls = mappings
-            dw_KD = 1
-            for lname in self.criteria :
-                lfunc = self.criteria[lname].func
-                lweight = self.criteria[lname].weight
-                if lname == 'ir_distillation' :
-                    if  target_hat_com is not None:
-                        logits_KD = self.previous_linear(features[kd_index])[:,:self.last_valid_out_dim]
-                        logits_KD_past = self.previous_linear(self.previous_teacher.generate_scores_pen(pts_com[kd_index]))[:,:self.last_valid_out_dim]
-                        lval = lfunc(logits_KD, logits_KD_past,dw_KD)
+                # L_CBS and accuracy use all seen classes. Only the linear head receives its gradient.
+                output = self.model.final(features.detach())[:, :self.valid_out_dim]
+                old_fraction = self.last_valid_out_dim / self.valid_out_dim
+                new_fraction = 1 - old_fraction
+                values = {}
+                if 'domain_consistency' in active:
+                    # L_DC supervises only the real sequences and the current new class logits.
+                    new_logits = self.model.final(features[:len(pts)])[:, self.last_valid_out_dim:self.valid_out_dim]
+                    dc = active['domain_consistency'].func
+                    if new_logits.size(1) == 1:
+                        values['domain_consistency'] = dc(new_logits, torch.ones_like(new_logits), new_fraction, binary=True)
                     else:
-                        lval = torch.zeros((1,), requires_grad=True).cuda()
-                    losses[lname].update(lval.item(), output.size(0) )
-                    loss_tensors.append(lweight * lval)
-                elif lname == 'domain_consistency':
-                    if self.inversion_replay:
-                        if self.cfg.increm.other_split_size == 1:
-                            local_clf = lfunc(output[batch_idx,self.last_valid_out_dim:self.valid_out_dim], torch.unsqueeze((target[batch_idx]-self.last_valid_out_dim + 1).float(), dim=1), data_weights=dw_cls[batch_idx], binary=True)
-                        else:
-                            local_clf = lfunc(output[batch_idx,self.last_valid_out_dim:self.valid_out_dim], (target[batch_idx]-self.last_valid_out_dim).long(), dw_cls[batch_idx])
-                        lval = local_clf
-                        losses[lname].update(lval.item(), len(batch_idx) )
-                        loss_tensors.append(lweight * lval)
-                elif lname == 'smooth_regularization':
-                    frame_feats = self.model.forward_frame_features(pts_com)
-                    lval = lfunc(frame_feats)
-                    losses[lname].update(lval.item(), output.size(0))
-                    loss_tensors.append(lweight * lval)
-                else:        # category_boundary_separation
-                    if self.inversion_replay:
-                        with torch.no_grad():
-                            feature = self.model.forward_feature(pts_com).detach()
-                        ft_clf = lfunc(self.model.final(feature)[:, :self.valid_out_dim], target_com.long(), dw_cls)
-                        lval = ft_clf
-                        losses[lname].update(lval.item(), output.size(0) )
-                        loss_tensors.append(lweight * lval)
-                    else:
-                        lval = lfunc(output[batch_idx], target_com[batch_idx])
-                    losses[lname].update(lval, len(batch_idx) )
-                    loss_tensors.append(lweight * lval)
-            loss = sum(loss_tensors)
+                        values['domain_consistency'] = dc(new_logits, target - self.last_valid_out_dim, new_fraction)
+                if 'category_boundary_separation' in active:
+                    weights = output.new_full((len(combined_targets),), old_fraction)
+                    weights[:len(pts)] = new_fraction
+                    values['category_boundary_separation'] = active['category_boundary_separation'].func(
+                        output, combined_targets, weights)
+                if 'smooth_regularization' in active:
+                    values['smooth_regularization'] = active['smooth_regularization'].func(frame_feats)
+
+                loss = sum(active[name].weight * value for name, value in values.items())
+                for name, value in values.items():
+                    count = len(pts) if name == 'domain_consistency' else len(combined_targets)
+                    losses[name].update(value.item(), count)
 
             self.optimizer.zero_grad()
             loss.backward()
-
             self.optimizer.step()
 
-            if  self.cfg.increm.freeze_classifier and current_t_index > 0:
-                self.model.final.weight.data[:self.last_valid_out_dim] = self.prev_weights[:self.last_valid_out_dim]
-                self.model.final.bias.data[:self.last_valid_out_dim] = self.prev_bias[:self.last_valid_out_dim]
-
-            train_acc_global = acc_meter_global(output, target_com) * 100
-
-            if step_per_batch :
+            train_acc_global = acc_meter_global(output.detach(), combined_targets) * 100
+            if step_per_batch:
                 optimizer_defs.step_scheduler(self.scheduler)
-
-            if self.args.gpu == 0 :
+            if tbar is not None:
                 tbar.update()
-                tbar.set_postfix({
-                        'it': bi,
-                        'loss': loss.item(),
-                        'train_acc_global': train_acc_global.item(),
-                })
+                tbar.set_postfix({'it': bi, 'loss': loss.item(), 'train_acc_global': train_acc_global.item()})
                 tbar.refresh()
 
-            bi += 1
-        if self.args.gpu == 0 :
-            acc_all = acc_meter_global.compute() * 100
-
-            train_logger.update(
-                {'learning_rate': self.optimizer.param_groups[0]['lr']},
-                step=epoch, prefix="stepwise")
-
-            train_logger.update(
-                { ltype: lmeter.avg for ltype, lmeter in losses.items() },
-                step=epoch, prefix="loss")
-
-            train_logger.update({
-                'global': acc_all,
-                }, step=epoch, prefix="acc" )
-
-            acc_meter_global.reset()
-
+        if train_logger is not None:
+            train_logger.update({'learning_rate': self.optimizer.param_groups[0]['lr']},
+                                step=epoch, prefix="stepwise")
+            train_logger.update({name: meter.avg for name, meter in losses.items()}, step=epoch, prefix="loss")
+            train_logger.update({'global': acc_meter_global.compute() * 100}, step=epoch, prefix="acc")
             train_logger.flush()
 
     @torch.no_grad()
-    def validate_epoch(self, vbar, epoch, val_logger) :
-        losses = edict({
-            name: utils.AverageMeter() for name in self.criteria
-        })
-
-        # Class to save epoch metrics
-        acc_meter = torchmetrics.Accuracy(task='multiclass', num_classes=self.valid_out_dim).cuda(self.args.gpu)
-
+    def validate_epoch(self, vbar, epoch, val_logger):
+        device = next(self.model.parameters()).device
+        acc_meter = torchmetrics.Accuracy(task='multiclass', num_classes=self.valid_out_dim).to(device)
+        ce_meter = utils.AverageMeter()
         self.model.eval()
-
-        if self.args.gpu == 0 :
+        if vbar is not None:
             vbar.reset(total=len(self.val_loader))
             vbar.refresh()
 
-        n_batches = len(self.val_loader)
-        iter_loader = iter(self.val_loader)
-        bi = 1
-        while bi <= n_batches :
-            data = next(iter_loader)
-            utils.tensor_dict_to_cuda(data, self.args.gpu)
-
-            pts, target = data.pts, data.label
-            for i, target_class in enumerate(target):
-                target[i] = self.cfg.class_mapping[str(target_class.item())]
-
+        for bi, data in enumerate(self.val_loader, start=1):
+            pts, target = real_batch(data, self.cfg.class_mapping, device)
             output = self.model(pts)[:, :self.valid_out_dim]
-
-            loss_tensors = []
-            for lname in self.criteria :
-                lfunc = self.criteria[lname].func
-                lweight = self.criteria[lname].weight
-                if lname in ['ir_distillation', 'domain_consistency']:
-                    lval = torch.zeros((1,), requires_grad=True).cuda()
-                else:
-                    lval = lfunc(output, target)
-                losses[lname].update(lval.item(), output.size(0) )
-                loss_tensors.append(lweight * lval)
-
-            loss = sum(loss_tensors)
-
-            val_acc= acc_meter(output, target) * 100
-
-            if self.args.gpu == 0 :
+            loss = F.cross_entropy(output, target)
+            ce_meter.update(loss.item(), len(pts))
+            val_acc = acc_meter(output, target) * 100
+            if vbar is not None:
                 vbar.update()
-                vbar.set_postfix({
-                    'it': bi,
-                    'loss': loss.item(),
-                    'val_acc': val_acc.item(),
-                })
+                vbar.set_postfix({'it': bi, 'loss': loss.item(), 'val_acc': val_acc.item()})
                 vbar.refresh()
 
-            bi += 1
-        if self.args.gpu == 0 :
-            acc_all = acc_meter.compute() * 100
-
-            val_logger.update(
-                { ltype: lmeter.avg for ltype, lmeter in losses.items() },
-                step=epoch, prefix="loss")
-
-            val_logger.update({
-                'global': acc_all,
-                }, step=epoch, prefix="acc" )
-
-            acc_meter.reset()
+        metrics = {name: ce_meter.avg if name == 'category_boundary_separation' else 0. for name in self.criteria}
+        accuracy = acc_meter.compute() * 100
+        if val_logger is not None:
+            val_logger.update(metrics, step=epoch, prefix="loss")
+            val_logger.update({'global': accuracy}, step=epoch, prefix="acc")
             val_logger.flush()
-
-            return_values = { ltype: lmeter.avg for ltype, lmeter in losses.items() }
-            return_values['acc'] = acc_all
-
-            return return_values
+        return {**metrics, 'acc': accuracy}
 
     def sample(self, teacher):
         return teacher.sample()
 
     def generate_inverted_samples(self, teacher, size, inversion_batch_size, dataloader_batch_size, log_dir,inverted_sample_dir):
         return teacher.generate_inverted_samples(size, inversion_batch_size, dataloader_batch_size, log_dir,inverted_sample_dir)
-
-    def combine_data(self, data):
-        x, y = [],[]
-        for i in range(len(data)):
-            x.append(data[i][0])
-            y.append(data[i][1])
-        x, y = torch.cat(x), torch.cat(y)
-        return x, y
